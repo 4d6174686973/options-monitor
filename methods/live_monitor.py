@@ -2,7 +2,6 @@ import asyncio
 import logging
 import numpy as np
 import pandas as pd
-import yfinance as yf
 from ib_insync import *
 from datetime import datetime, timedelta
 import colorama
@@ -10,26 +9,66 @@ from colorama import Fore, Style
 
 colorama.init(autoreset=True)
 
-# ==========================================
-# 1. SILENCE THE LOGGING SPAM
-# ==========================================
-# This is the nuclear option to stop Error 10091 from flooding the console
+# 1. SILENCE LOGGING
 logging.getLogger('ib_insync').setLevel(logging.CRITICAL)
 
 def onError(reqId, errorCode, errorString, contract):
-    # We still keep this to catch critical connection issues
     if errorCode in [10091, 2104, 2106, 2158]: return
     print(f"{Fore.RED}IBKR Error {errorCode}: {errorString}")
 
 # ==========================================
-# 2. MATH ENGINE (FHS Simulation)
+# 2. DATA ENGINE (Native IBKR)
 # ==========================================
-def get_fhs_distribution(ticker, days_to_expiry=30, n_paths=5000):
-    print(f"{Fore.CYAN}--- FHS: Fetching history for {ticker} ---")
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=365*3)
-    df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+async def fetch_ib_history(ib, contract, duration='3 Y'):
+    """
+    Fetches 3 Years of Daily candles from IBKR.
+    """
+    print(f"{Fore.CYAN}--- Fetching IBKR History for {contract.symbol} ---")
     
+    # Check if contract is qualified, if not, qualify it
+    if not contract.conId:
+        await ib.qualifyContractsAsync(contract)
+    
+    # Request History
+    # whatToShow='TRADES' is standard for generic High/Low volatility
+    bars = await ib.reqHistoricalDataAsync(
+        contract,
+        endDateTime='',
+        durationStr=duration,
+        barSizeSetting='1 day',
+        whatToShow='TRADES',
+        useRTH=True,        # Regular Trading Hours only (avoids bad spikes)
+        formatDate=1,
+        keepUpToDate=False
+    )
+    
+    if not bars:
+        raise ValueError("No historical data returned from IBKR.")
+
+    # Convert to DataFrame
+    df = util.df(bars)
+    
+    # Normalize Columns (IBKR uses lowercase, we need Title Case for consistency)
+    df.rename(columns={
+        'date': 'Date', 
+        'open': 'Open', 
+        'high': 'High', 
+        'low': 'Low', 
+        'close': 'Close', 
+        'volume': 'Volume'
+    }, inplace=True)
+    
+    df.set_index('Date', inplace=True)
+    return df
+
+# ==========================================
+# 3. MATH ENGINE (FHS Simulation)
+# ==========================================
+def run_fhs_simulation(df, days_to_expiry, n_paths=20000):
+    """
+    Runs Filtered Historical Simulation on the provided DataFrame.
+    Note: n_paths increased to 20,000 to capture tails in short timeframes.
+    """
     # Garman-Klass Volatility
     log_hl = np.log(df['High'] / df['Low'])
     log_co = np.log(df['Close'] / df['Open'])
@@ -42,11 +81,15 @@ def get_fhs_distribution(ticker, days_to_expiry=30, n_paths=5000):
     
     # Bootstrap
     shock_pool = df['Z'].values
+    
+    # Use the LAST KNOWN volatility and price from history
     current_vol = df['GK_Vol'].iloc[-1]
     if isinstance(current_vol, pd.Series): current_vol = current_vol.item()
+    
     current_price = df['Close'].iloc[-1]
     if isinstance(current_price, pd.Series): current_price = current_price.item()
 
+    # Simulate
     random_shocks = np.random.choice(shock_pool, size=(days_to_expiry, n_paths))
     sim_returns = random_shocks * current_vol
     cum_returns = np.sum(sim_returns, axis=0)
@@ -55,27 +98,17 @@ def get_fhs_distribution(ticker, days_to_expiry=30, n_paths=5000):
     return sim_prices, current_price
 
 # ==========================================
-# 3. ROBUST PRICING LOGIC
+# 4. PRICING UTILS
 # ==========================================
 def get_robust_price(ticker, side):
-    """
-    Prioritizes CLOSE price over LAST price to avoid stale data issues.
-    """
-    # 1. If Market is Open, use Bid/Ask
     if side == 'sell' and ticker.bid > 0: return ticker.bid
     if side == 'buy' and ticker.ask > 0: return ticker.ask
-    
-    # 2. If Market Closed/Frozen, use CLOSE (Settlement)
-    # This is safer than 'Last' which can be asynchronous/stale
     if ticker.close > 0: return ticker.close
-    
-    # 3. Fallback to Last, then midpoint
     if ticker.last > 0: return ticker.last
-    
     return 0.0
 
 # ==========================================
-# 4. MAIN LOOP
+# 5. MAIN EXECUTION
 # ==========================================
 async def main():
     ib = IB()
@@ -87,29 +120,42 @@ async def main():
         print(f"{Fore.RED}Connection Failed: {e}")
         return
 
-    # Use 'Frozen' data (Type 4) so we get Closing Prices
+    # Use Delayed Frozen (Type 4) for testing
     ib.reqMarketDataType(4)
-    print(f"{Fore.YELLOW}Connected. Using Delayed Frozen Data (Type 4).")
+    print(f"{Fore.YELLOW}Connected. Data Type: Frozen/Delayed.")
 
     SYMBOL = 'SPY'
-
-    today = datetime.now().date()
-    days_until_friday = (4 - today.weekday()) % 7
-    this_friday = today + timedelta(days=days_until_friday)
-
-    # Calculate DTE dynamically
-    dte = (this_friday - today).days
-    if dte == 0: dte = 1 # Handle Friday 0DTE as 1-day vol
-
-    # Pass the actual DTE into the simulation
-    sim_prices, spot_ref = get_fhs_distribution(SYMBOL, days_to_expiry=dte)
-
-    # --- CHAIN SELECTION ---
     contract = Stock(SYMBOL, 'SMART', 'USD')
     await ib.qualifyContractsAsync(contract)
+    
+    # --- STEP 1: GET IBKR HISTORY ---
+    try:
+        history_df = await fetch_ib_history(ib, contract)
+    except Exception as e:
+        print(f"{Fore.RED}Failed to fetch history: {e}")
+        ib.disconnect()
+        return
+
+    # --- STEP 2: CALCULATE DTE ---
+    today = datetime.now().date()
+    days_until_friday = (4 - today.weekday()) % 7
+    if days_until_friday == 0: days_until_friday = 0 # 0DTE logic (Intraday)
+    
+    # If today is Friday, we might want to target next week, 
+    # but for now let's simulate the remaining time. 
+    # If 0 days left, we simulate 1 day to be safe.
+    sim_days = max(1, days_until_friday)
+    
+    print(f"Simulation Horizon: {sim_days} Day(s) (Matching DTE)")
+    
+    # --- STEP 3: RUN FHS ---
+    sim_prices, spot_ref = run_fhs_simulation(history_df, days_to_expiry=sim_days)
+    print(f"Ref Spot (IBKR): {spot_ref:.2f}")
+
+    # --- STEP 4: CHAIN & STRIKES ---
     chains = await ib.reqSecDefOptParamsAsync(contract.symbol, '', contract.secType, contract.conId)
     
-    # Find Weekly Expiry
+    this_friday = today + timedelta(days=days_until_friday)
     expiry_str = this_friday.strftime('%Y%m%d')
 
     target_chain = None
@@ -120,22 +166,21 @@ async def main():
             
     if not target_chain:
         print(f"Expiry {expiry_str} not found.")
+        ib.disconnect()
         return
 
-    print(f"Targeting Expiry: {expiry_str} (Class: {target_chain.tradingClass})")
+    print(f"Targeting Expiry: {expiry_str}")
 
-    # --- STRIKE FILTERING (Weekly Aware) ---
+    # Filter Strikes (0.5% to 5% OTM)
     valid_strikes = sorted(list(target_chain.strikes))
-    
-    # Look for strikes 0.5% to 5.0% OTM
     upper_bound = spot_ref * 0.995
     lower_bound = spot_ref * 0.950
-    
     potential_shorts = [k for k in valid_strikes if lower_bound < k < upper_bound]
-    print(f"Scanning {len(potential_shorts)} strikes between {lower_bound:.1f} and {upper_bound:.1f}")
+    
+    print(f"Scanning {len(potential_shorts)} strikes ({lower_bound:.1f} - {upper_bound:.1f})")
 
-    # --- BUILD SPREADS ---
-    SPREAD_WIDTHS = [1, 2, 3, 5, 10, 15, 20]
+    # --- STEP 5: BUILD & SCAN ---
+    SPREAD_WIDTHS = [1, 5, 10, 15] 
     contracts_to_req = []
     spread_combos = []
     seen = set()
@@ -158,32 +203,20 @@ async def main():
                     seen.add(key)
 
     contracts_to_req = unique_reqs
-    print(f"Qualifying {len(contracts_to_req)} contracts...")
     contracts_to_req = await ib.qualifyContractsAsync(*contracts_to_req)
     
-    # --- REQUEST DATA (SNAPSHOT MODE) ---
-    # Snapshot=True is often cleaner for frozen/post-market data
-    print("Requesting Market Data Snapshots...")
+    print("Requesting Snapshots...")
     tickers = {}
     for c in contracts_to_req:
-        tickers[c.conId] = ib.reqMktData(c, '', True, False) # Snapshot=True
+        tickers[c.conId] = ib.reqMktData(c, '', True, False)
         
-    # Wait for Data
-    print("Waiting for data fill...")
     for i in range(10):
         await asyncio.sleep(1)
         filled = sum(1 for t in tickers.values() if t.close > 0 or t.last > 0 or t.bid > 0)
         print(f"Data Fill: {filled}/{len(tickers)}...")
         if filled == len(tickers): break
 
-    print(f"\n{Fore.GREEN}=== DATA DEBUG (First 3 Contracts) ===")
-    debug_count = 0
-    for t in tickers.values():
-        if debug_count >= 3: break
-        print(f"Strike: {t.contract.strike} | Bid: {t.bid} | Ask: {t.ask} | Last: {t.last} | Close: {t.close}")
-        debug_count += 1
-
-    print(f"\n{Fore.GREEN}=== RUNNING ANALYSIS ===")
+    print(f"\n{Fore.GREEN}=== ANALYSIS RESULTS ===")
 
     while True:
         opportunities = []
@@ -198,15 +231,12 @@ async def main():
             
             if not t_short or not t_long: continue
             
-            # GET PRICES (Prioritizing Close)
             price_short = get_robust_price(t_short, 'sell')
             price_long = get_robust_price(t_long, 'buy')
             
             if price_short == 0 or price_long == 0: continue
 
             net_credit = price_short - price_long
-            
-            # Filter low value trades
             if net_credit < 0.01: continue 
             
             # --- FHS METRICS ---
@@ -220,8 +250,8 @@ async def main():
             losses = worst_5[worst_5 < 0]
             cvar = abs(np.mean(losses)) if len(losses) > 0 else 0
             
+            ratio = net_credit / cvar if cvar > 0.01 else 20.0
             pop = np.sum(pnl_vector > 0) / len(pnl_vector)
-            ratio = net_credit / cvar if cvar > 0.01 else 10.0
             
             opportunities.append({
                 'Short': short_c.strike,
@@ -232,11 +262,10 @@ async def main():
                 'PoP': pop * 100
             })
             
-        # Display
         df = pd.DataFrame(opportunities)
         if not df.empty:
-            df = df.sort_values(by='Ratio', ascending=False).head(5)
-            print(f"\n{datetime.now().strftime('%H:%M:%S')} | TOP OPPORTUNITIES")
+            df = df.sort_values(by='Ratio', ascending=False).head(10)
+            print(f"\n{datetime.now().strftime('%H:%M:%S')} | TOP 10 OPPORTUNITIES")
             print("-" * 65)
             print(f"{'Short':<8} {'Width':<6} {'Credit':<8} {'CVaR':<8} {'Ratio':<8} {'PoP':<6}")
             print("-" * 65)
@@ -244,13 +273,10 @@ async def main():
                 c = Fore.GREEN if row['Ratio'] > 0.4 else Fore.WHITE
                 print(f"{c}{row['Short']:<8.1f} {row['Width']:<6} {row['Credit']:<8.2f} {row['CVaR']:<8.2f} {row['Ratio']:<8.3f} {row['PoP']:<6.1f}")
         else:
-            print(f"{Fore.YELLOW}No valid spreads found. (Credit too low or Prices missing)")
+            print(f"{Fore.YELLOW}No valid spreads found.")
 
-        # In snapshot mode, data doesn't update, so we break after one pass
-        # In live mode (snapshot=False), you would sleep and loop.
-        break 
+        break # Exit after one pass for snapshot mode
 
-    print(f"\n{Fore.CYAN}Analysis Complete. Disconnecting...")
     ib.disconnect()
 
 if __name__ == '__main__':
