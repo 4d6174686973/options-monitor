@@ -4,166 +4,182 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 
 # ==========================================
-# 1. Data Processing & Volatility Filtering
+# 1. Data Processing (Unchanged)
 # ==========================================
 
 def fetch_data(ticker, start_date, end_date):
-    """Fetches OHLC data from Yahoo Finance."""
     data = yf.download(ticker, start=start_date, end=end_date, progress=False)
     data.dropna(inplace=True)
     return data
 
 def garman_klass_vol(data):
-    """
-    Calculates the Garman-Klass volatility estimator.
-    More efficient than Close-to-Close because it uses High/Low/Open.
-    
-    Formula: 0.5 * ln(H/L)^2 - (2*ln(2)-1) * ln(C/O)^2
-    """
-    # Avoid division by zero by handling flat candles if necessary, though log(1)=0 is fine.
     log_hl = np.log(data['High'] / data['Low'])
     log_co = np.log(data['Close'] / data['Open'])
-    
     gk_var = 0.5 * (log_hl ** 2) - (2 * np.log(2) - 1) * (log_co ** 2)
-    return np.sqrt(gk_var) # Return Volatility (Standard Deviation equivalent)
+    return np.sqrt(gk_var)
 
 def prepare_fhs_data(data):
-    """
-    Prepares the 'Pool of Shocks' (Z-scores) for bootstrapping.
-    """
-    # 1. Calculate Raw Log Returns (Close-to-Close)
     data['Log_Ret'] = np.log(data['Close'] / data['Close'].shift(1))
-    
-    # 2. Calculate Garman-Klass Volatility for every historical day
     data['GK_Vol'] = garman_klass_vol(data)
-    
-    # 3. Filter (De-volatilize) the returns
-    # We divide the return by the volatility of THAT specific day.
-    # This creates a "Standardized Shock" (Z) that is regime-independent.
-    # Epsilon added to prevent division by zero
     data['Z'] = data['Log_Ret'] / (data['GK_Vol'] + 1e-9)
-    
     return data.dropna()
 
 # ==========================================
-# 2. Simulation Engine (Bootstrapping)
+# 2. Simulation Engine (Fixed for Pandas Errors)
 # ==========================================
 
-def run_fhs(data, days_to_expiry=30, n_paths=10000):
-    """
-    Simulates future price paths using bootstrapped shocks scaled by CURRENT volatility.
-    """
-    # The pool of historical standardized shocks
+def run_fhs(data, days_to_expiry=7, n_paths=10000):
     shock_pool = data['Z'].values
     
-    # FIX: Extract as scalar floats to avoid Pandas Series alignment errors
     current_vol = data['GK_Vol'].iloc[-1]
-    if isinstance(current_vol, pd.Series):
-        current_vol = current_vol.item()
+    if isinstance(current_vol, pd.Series): current_vol = current_vol.item()
         
     current_price = data['Close'].iloc[-1]
-    if isinstance(current_price, pd.Series):
-        current_price = current_price.item()
+    if isinstance(current_price, pd.Series): current_price = current_price.item()
     
-    # Randomly sample shocks
     random_shocks = np.random.choice(shock_pool, size=(days_to_expiry, n_paths))
-    
-    # Re-volatilize
     simulated_daily_returns = random_shocks * current_vol
     cumulative_returns = np.sum(simulated_daily_returns, axis=0)
-    
-    # This multiplication will now work because current_price is a float, not a Series
     simulated_prices = current_price * np.exp(cumulative_returns)
     
     return simulated_prices, current_price
 
 # ==========================================
-# 3. Strike Selection (CVaR & Sortino)
+# 3. Spread Optimization (New Logic)
 # ==========================================
 
-def optimize_strike(simulated_prices, current_price, risk_tolerance_cvar=0.05):
+def calculate_spread_metrics(sim_prices, short_strike, long_strike, spread_type='put'):
     """
-    Iterates through strikes to find optimal Risk/Reward.
+    Calculates PnL vector and risk metrics for a specific vertical spread.
     """
-    # Define search range: 5% OTM to 20% OTM Puts
-    start_strike = int(current_price * 0.80)
-    end_strike = int(current_price * 0.95)
-    strikes = range(start_strike, end_strike, 1) # $1 steps
+    # 1. Calculate Fair Value of both legs based on simulation
+    if spread_type == 'put':
+        # Put: Max(K - S, 0)
+        short_payoff = np.maximum(short_strike - sim_prices, 0)
+        long_payoff = np.maximum(long_strike - sim_prices, 0)
+    else:
+        # Call: Max(S - K, 0)
+        short_payoff = np.maximum(sim_prices - short_strike, 0)
+        long_payoff = np.maximum(sim_prices - long_strike, 0)
+        
+    fair_value_short = np.mean(short_payoff)
+    fair_value_long = np.mean(long_payoff)
     
+    # 2. Net Credit (Fair Value * Edge Factor)
+    # We assume we sell slightly better than fair value and buy slightly worse
+    # due to bid-ask spread. Here we apply a flat "Edge" on the net result for simplicity.
+    raw_credit = fair_value_short - fair_value_long
+    market_credit = raw_credit * 1.10  # 10% edge assumption
+    
+    if market_credit <= 0.01: return None # Skip worthless spreads
+
+    # 3. Calculate PnL Vector for the Spread
+    # PnL = Credit - (Payout_Short - Payout_Long)
+    # Note: Payouts are positive values (losses to the seller)
+    net_payouts = short_payoff - long_payoff
+    pnl_vector = market_credit - net_payouts
+    
+    # 4. Calculate Risk Metrics
+    
+    # CVaR (Expected Shortfall): Average loss of worst 5% outcomes
+    tail_cutoff = int(len(pnl_vector) * 0.05)
+    sorted_pnl = np.sort(pnl_vector)
+    worst_5_percent = sorted_pnl[:tail_cutoff]
+    
+    # Filter for actual losses in the tail to calculate downside risk
+    losses = worst_5_percent[worst_5_percent < 0]
+    if len(losses) == 0:
+        cvar = 0 # No losses in the worst 5% (Very safe, or low vol)
+    else:
+        cvar = abs(np.mean(losses))
+        
+    # Win Rate
+    pop = np.sum(pnl_vector > 0) / len(pnl_vector)
+    
+    # Sortino-like Ratio: Credit / CVaR
+    # If CVaR is 0 (safe trade), we cap ratio to avoid infinity
+    ratio = market_credit / cvar if cvar > 0.01 else 999 
+
+    return {
+        'Type': spread_type.upper(),
+        'Short': short_strike,
+        'Long': long_strike,
+        'Credit': round(market_credit, 2),
+        'Max_Loss': abs(short_strike - long_strike) - market_credit,
+        'PoP': round(pop * 100, 1),
+        'CVaR': round(cvar, 2),
+        'Ratio': round(ratio, 3)
+    }
+
+def optimize_spreads(sim_prices, current_price, spread_width=5):
     results = []
     
-    for K in strikes:
-        # 1. Calculate Theoretical Premium (Fair Value)
-        # In a real system, you would grab the REAL BID price here.
-        # We simulate "Fair Value" as the average payout of the option.
-        intrinsic_values = np.maximum(K - simulated_prices, 0)
-        fair_value = np.mean(intrinsic_values)
+    # --- PUT SPREADS (Below Market) ---
+    # Scan strikes from 15% OTM to 2% OTM
+    start_k = int(current_price * 0.85)
+    end_k = int(current_price * 0.98)
+    
+    for k_short in range(start_k, end_k, 1):
+        k_long = k_short - spread_width
+        metrics = calculate_spread_metrics(sim_prices, k_short, k_long, 'put')
+        if metrics: results.append(metrics)
+
+    # --- CALL SPREADS (Above Market) ---
+    # Scan strikes from 2% OTM to 15% OTM
+    start_k = int(current_price * 1.02)
+    end_k = int(current_price * 1.15)
+    
+    for k_short in range(start_k, end_k, 1):
+        k_long = k_short + spread_width
+        metrics = calculate_spread_metrics(sim_prices, k_short, k_long, 'call')
+        if metrics: results.append(metrics)
         
-        # Apply a "Market Edge" (Assuming we sell for 10% over fair value for the example)
-        market_premium = fair_value * 1.10
-        if market_premium < 0.05: continue # Skip worthless options
-        
-        # 2. Calculate PnL Vector
-        # Profit = Premium - Loss (if ITM)
-        pnl_vector = market_premium - intrinsic_values
-        
-        # 3. Calculate CVaR (Expected Shortfall)
-        # Average loss of the worst 5% of cases
-        tail_cutoff = int(len(pnl_vector) * 0.05)
-        sorted_pnl = np.sort(pnl_vector)
-        worst_5_percent = sorted_pnl[:tail_cutoff]
-        cvar = abs(np.mean(worst_5_percent)) # Absolute value for ratio calc
-        
-        # 4. Calculate Win Rate (PoP)
-        pop = np.sum(pnl_vector > 0) / len(pnl_vector)
-        
-        # 5. Sortino-like Ratio (Reward / Tail Risk)
-        ratio = market_premium / cvar if cvar > 0 else 0
-        
-        results.append({
-            'Strike': K,
-            'Premium': round(market_premium, 2),
-            'PoP': round(pop * 100, 1),
-            'CVaR': round(cvar, 2),
-            'Ratio': round(ratio, 4),
-            'Pct_OTM': round((1 - K/current_price)*100, 1)
-        })
-        
-    df_results = pd.DataFrame(results)
-    return df_results.sort_values(by='Ratio', ascending=False)
+    df = pd.DataFrame(results)
+    return df
 
 # ==========================================
 # 4. Main Execution
 # ==========================================
 
 if __name__ == "__main__":
-    # Settings
-    TICKER = "NVDA" 
-    START = "2018-01-01" # Includes 2020 crash and 2022 bear market
+    TICKER = "NVDA"
+    START = "2019-01-01"
     END = "2023-12-30"
+    SPREAD_WIDTH = 5  # $5 Wide Spreads
     
-    print(f"--- 1. Fetching Data for {TICKER} ---")
+    print(f"--- FHS Optimization for {TICKER} ---")
     df = fetch_data(TICKER, START, END)
-    
-    print("--- 2. Pre-processing & De-volatilizing ---")
     df_clean = prepare_fhs_data(df)
+    sim_prices, spot = run_fhs(df_clean)
     
-    print(f"--- 3. Running Simulation (10,000 Paths) ---")
-    sim_prices, spot = run_fhs(df_clean, days_to_expiry=30, n_paths=10000)
+    print(f"Spot Price: ${spot:.2f}")
+    print(f"Spread Width: ${SPREAD_WIDTH}")
     
-    print(f"Current Spot: {spot:.2f}")
+    df_results = optimize_spreads(sim_prices, spot, spread_width=SPREAD_WIDTH)
     
-    print("--- 4. Optimizing Strike Selection ---")
-    results = optimize_strike(sim_prices, spot)
+    # Separate and Display Top Puts and Calls
+    puts = df_results[df_results['Type'] == 'PUT'].sort_values(by='Ratio', ascending=False).head(5)
+    calls = df_results[df_results['Type'] == 'CALL'].sort_values(by='Ratio', ascending=False).head(5)
     
-    # Display Top 5 Strikes by Reward-to-Risk Ratio
-    print("\nTop 5 Strikes (Sorted by Premium/CVaR Ratio):")
-    print(results.head(5).to_string(index=False))
+    print("\n--- TOP 5 PUT SPREADS (High Efficiency) ---")
+    print(puts[['Short', 'Long', 'Credit', 'PoP', 'CVaR', 'Ratio']].to_string(index=False))
     
-    # Visualization
-    plt.figure(figsize=(10,5))
-    plt.hist(sim_prices, bins=100, density=True, alpha=0.6, color='blue', label='FHS Distribution')
-    plt.axvline(spot, color='red', linestyle='--', label='Current Price')
-    plt.title(f"Filtered Historical Simulation Distribution ({TICKER})")
+    print("\n--- TOP 5 CALL SPREADS (High Efficiency) ---")
+    print(calls[['Short', 'Long', 'Credit', 'PoP', 'CVaR', 'Ratio']].to_string(index=False))
+
+    # Optional: Plotting the "Efficiency Frontier"
+    plt.figure(figsize=(10, 6))
+    
+    puts_all = df_results[df_results['Type'] == 'PUT']
+    calls_all = df_results[df_results['Type'] == 'CALL']
+    
+    plt.scatter(puts_all['Short'], puts_all['Ratio'], c='red', label='Put Spreads', alpha=0.6)
+    plt.scatter(calls_all['Short'], calls_all['Ratio'], c='green', label='Call Spreads', alpha=0.6)
+    
+    plt.axvline(spot, color='black', linestyle='--', label='Spot Price')
+    plt.xlabel('Short Strike Price ($)')
+    plt.ylabel('Sortino Ratio (Credit / Tail Risk)')
+    plt.title(f'Strike Selection Efficiency Frontier ({TICKER})')
     plt.legend()
+    plt.grid(True, alpha=0.3)
     plt.show()

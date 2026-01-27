@@ -5,6 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "colorama>=0.4.6",
+    "ib-insync>=0.9.86",
     "matplotlib>=3.10.8",
     "numpy>=2.4.0",
     "pandas>=2.3.3",
