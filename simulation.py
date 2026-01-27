@@ -25,7 +25,7 @@ st.sidebar.info("High probability, limited payout (e.g., Credit Spreads).")
 farmer_alloc = 0.60
 farmer_win_rate = st.sidebar.slider("Farmer Win Rate (%)", 60, 95, 80) / 100.0
 farmer_roi = st.sidebar.slider("Farmer ROI per Week (%)", 1.0, 10.0, 2.0) / 100.0
-farmer_loss_pct = st.sidebar.slider("Max Loss on Farmer Risk (%)", 50, 100, 100) / 100.0
+farmer_loss_pct = st.sidebar.slider("Max Loss on Farmer Risk (%)", 0, 100, 100) / 100.0
 # Note: In credit spreads, if you lose, you often lose 1x-3x the premium collected.
 # Here we model it as losing a percentage of the allocated capital.
 
